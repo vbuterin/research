@@ -66,5 +66,3 @@ for i in range(6):
     # The subsidy would go to charity workers only
     print('Cost of providing equipotent straight subsidy: %.2f'
            % (equiv_subsidy_size * c2))
-
-#c2 * i * 0.08)
