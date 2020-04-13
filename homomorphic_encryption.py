@@ -48,6 +48,10 @@ class Ciphertext():
             modulus = self.modulus
         )
 
+    # Convert 0 to 1 or 1 to 0
+    def flip(self):
+        return Ciphertext(aux=self.aux, out=(self.out+1) % self.modulus, modulus=self.modulus)
+
 # A dummy ciphertext to represent zero
 ZERO_CT = Ciphertext(aux=[], out=0, modulus=0)
 
@@ -175,6 +179,33 @@ def change_ciphertext_modulus(ct, modulus_change_key):
     new_ct.out = (new_ct.out + rescale_modulus(ct.out, oldq, newq)) % newq
     return new_ct
 
+def binary_encode(integer, length, encoded_zero, encoded_one):
+    return [encoded_one if integer & (1 << i) else encoded_zero for i in range(length)]
+
+def _or(a, b, tk):
+    return a + b + multiply_ciphertexts(a, b, tk)
+
+_and = multiply_ciphertexts
+
+# Kogge-Stone adder, see https://upload.wikimedia.org/wikipedia/commons/1/1c/4_bit_Kogge_Stone_Adder_Example_new.png
+def encoded_add(a, b, tk):
+    origp = [ai + bi for ai, bi in zip(a,b)]
+    p = origp[::]
+    g = [_and(ai, bi, tk) for ai, bi in zip(a,b)]
+    offset = 1
+    while 2**offset <= len(a):
+        for i in range(0, len(a)-offset):
+            p[i+offset] = _and(p[i], p[i+offset], tk)
+            g[i+offset] = _or(g[i+offset], _and(p[i+offset], g[i], tk), tk)
+        offset *= 2
+    return [origp[0]] + [origp[i] + g[i-1] for i in range(1, len(a))] + [g[-1]]
+
+def next_prime(n):
+    x = n + (n % 2) + 1
+    while pow(2, x, x) != 2:
+        x += 2
+    return x
+
 def test():
     modulus = 99991
     s = random_vector(5, modulus)
@@ -202,6 +233,14 @@ def test():
             cm = multiply_ciphertexts(cl, cr, tk)
             tuk = mk_modulus_change_key(t, u, modulus, short_modulus)
             assert decrypt(u, change_ciphertext_modulus(cm, tuk)) == decrypt(t, cm) == decrypt(s, cl) * decrypt(s, cr)
+    huge_modulus = next_prime(10**150)
+    S = random_vector(5, huge_modulus)
+    zero = encrypt(S, 0, huge_modulus)
+    one = encrypt(S, 1, huge_modulus)
+    forty_two = binary_encode(42, 8, zero, one)
+    sixty_nine = binary_encode(69, 8, zero, one)
+    one_one_one = encoded_add(forty_two, sixty_nine, mk_transit_key(S, S, huge_modulus))
+    assert sum([decrypt(S, x) << i for i, x in enumerate(one_one_one[:8])]) == 111
     print("Tests passed")
     
 if __name__ == '__main__':
