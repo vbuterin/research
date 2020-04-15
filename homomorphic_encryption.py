@@ -57,6 +57,18 @@ class Ciphertext():
 # A dummy ciphertext to represent zero
 ZERO_CT = Ciphertext(aux=[], out=0, modulus=0)
 
+def sum_ciphertexts(ciphertexts):
+    L, m = len(ciphertexts[0].aux), ciphertexts[0].modulus
+    if len(ciphertexts) == 0:
+        return Ciphertext(aux=[], out=0, modulus=0)
+    for c in ciphertexts[1:]:
+        assert c.modulus == m and len(c.aux) == L
+    return Ciphertext(
+        aux = [sum([c.aux[i] for c in ciphertexts]) % m for i in range(L)],
+        out = sum(c.out for c in ciphertexts) % m,
+        modulus = m
+    )
+
 # Encrypt a value (remember: out = aux . key + m + 2e)
 def encrypt(key, message, q):
     aux = random_vector(len(key), q)
@@ -86,12 +98,32 @@ def decrypt(key, ciphertext):
     half_q = (q // 2) - (q // 2) % 2
     return ((out - prod(aux, key, q) + half_q) % q) % 2
 
+# Expresses a number in a given base
+def express_in_base(n, base, length):
+    # Optimized special case for base 16
+    if BASE == 16:
+        o = []
+        for byte in n.to_bytes(length//2+1, 'little'): 
+            o.append(byte%16)
+            o.append(byte//16)
+        return o[:length]
+    else:
+        o = []
+        while n > 0:
+            o.append(n % base)
+            n //= base
+        return o + [0] * (length - len(o))
+
+BITS_PER_DIGIT = 4
+BASE = 2**BITS_PER_DIGIT
+
 @dataclass
 class TransitKeyComponent():
-    bits: list
+    digits: list # [[ciphertext]]
 
     def get_combination_for(self, index):
-        return sum([self.bits[i] for i in range(len(self.bits)) if (index & (1 << i))], ZERO_CT)
+        representation = express_in_base(index, BASE, len(self.digits))
+        return sum_ciphertexts([self.digits[power][representation[power]-1] for power in range(len(self.digits)) if representation[power] > 0])
 
 @dataclass
 class TransitKey():
@@ -105,18 +137,27 @@ class ModulusChangeKey():
     new_modulus: int
 
 def mk_transit_key(s, t, q):
-    # For each v=s[i], and for each product v=s[i] * s[j], encrypt v, v*2, v*4... under the key `t`
+    # For each v=s[i], and for each product v = s[i] * s[j], encrypt v, v*2, v*3... v*base, v*2*base, v*3*base...
+    # under the key `t`.
     # This allows us to compute s[i] * b or s[i] * s[j] * b for any b with a logarithmic number
     # of additions (and hence logarithmic-sized error blowup)
-    bit_count = bit_length(q)
+
+    # Determine the highest power we need to compute up to
+    power_count = 0
+    while BASE**power_count < q:
+        power_count += 1
+
+    # Precompute s[i]*s[j] products
+    s_products = [[s[i] * s[j] % q if j>=i else None for j in range(len(s))] for i in range(len(s))]
+
     return TransitKey(
         singles = [
-            TransitKeyComponent(bits=[encrypt(t, s[i] * 2**b, q) for b in range(bit_count)])
+            TransitKeyComponent(digits=[[encrypt(t, (s[i] * digit) << (BITS_PER_DIGIT * power), q) for digit in range(1, BASE)] for power in range(power_count)])
             for i in range(len(s))
         ],
         pairs = [
             [
-                TransitKeyComponent(bits=[encrypt(t, s[i] * s[j] * 2**b, q) for b in range(bit_count)])
+                TransitKeyComponent(digits=[[encrypt(t, (s_products[min(i,j)][max(i,j)] * digit) << (BITS_PER_DIGIT * power), q) for digit in range(1, BASE)] for power in range(power_count)])
                 for j in range(len(s))
             ]
             for i in range(len(s))
@@ -166,10 +207,12 @@ def rescale_modulus(x, q, p):
 # A transfer key similar to the key above, except with no quadratic terms and with a modulus change
 # Goal is to convert a ciphertext from being encrypted under key s (modulo q) to key t (modulo p)
 def mk_modulus_change_key(s, t, q, p):
-    bit_count = bit_length(q)
+    power_count = 0
+    while BASE**power_count < q:
+        power_count += 1
     return ModulusChangeKey(
         items = [
-            TransitKeyComponent(bits=[encrypt(t, rescale_modulus(s[i] * 2**b, q, p), p) for b in range(bit_count)])
+            TransitKeyComponent(digits=[[encrypt(t, rescale_modulus(s[i] * digit * BASE**power, q, p), p) for digit in range(1, BASE)] for power in range(power_count)])
             for i in range(len(s))
         ],
         old_modulus=q,
@@ -208,7 +251,7 @@ def encoded_add(a, b, tk):
 def encoded_add3(a, b, c, tk):
     return kogge_stone_propagate(
         [ai + bi + ci for ai, bi, ci in zip(a,b,c)],
-        [_and(ai, bi, tk) + _and(ai, ci, tk) + _and(bi, ci, tk) for ai, bi, ci in zip(a,b,c)],
+        [_and(ai + bi, ai + ci, tk) + ai for ai, bi, ci in zip(a,b,c)], # (a+b)(a+c)-a = (a+b)(a+c)-a2 = a2+ac+ab+bc-a2 = ab+ac+bc
         tk
     )
 
@@ -226,9 +269,11 @@ def kogge_stone_propagate(p, g, tk):
 def three_to_two(a, b, c, zero, tk):
     return (
         [ai + bi + ci for ai, bi, ci in zip(a,b,c)] + [zero],
-        [zero] + [_and(ai, bi, tk) + _and(ai, ci, tk) + _and(bi, ci, tk) for ai, bi, ci in zip(a,b,c)]
+        [zero] + [_and(ai + bi, ai + ci, tk) + ai for ai, bi, ci in zip(a,b,c)]
     )
 
+# Add together many numbers. Use the 3->2 adder in a tree structure (ok fine it's a DAG),
+# then finish off with a 3-to-1 or 2-to-1 as needed
 def multi_add(values, zero, tk):
     while len(values) > 2:
         o = []
@@ -244,3 +289,73 @@ def next_prime(n):
     while pow(2, x, x) != 2:
         x += 2
     return x
+
+# Takes the sum of the values and returns two bits:
+# (i) is sum(values) in (range_start....range_end-1)
+# (ii) is sum(values) - range_start odd (1) or even (0)?
+def add_and_return_remainder_parity_and_rangecheck(values, range_start, range_end, zero, one, tk):
+    assert range_end > range_start >= 1
+    bit_count = bit_length(range_end)
+    # 10000000000 - range_start = 1111111111 - (range_start-1)
+    encoded_complement_rstart = binary_encode(range_start - 1, bit_count, one, zero)
+    # 10000000000 - range_end = 1111111111 - (range_end-1)
+    encoded_complement_rend = binary_encode(range_end - 1, bit_count, one, zero)
+    # Should be >= 10000000000 if in range
+    sum_with_range_start = multi_add(values + [encoded_complement_rstart], zero, tk)
+    # Should be < 10000000000 if in range
+    sum_with_range_end = multi_add(values + [encoded_complement_rend], zero, tk)
+    is_in_range = _and(sum_with_range_start[bit_count], one + sum_with_range_end[bit_count], tk)
+    parity = sum_with_range_start[0]
+    return is_in_range, parity
+
+# A key used for the bootstrapping procedure. This involves running a decryption circuit for
+# scheme key `s` (and short modulus `q`) homomorphically encrypted under key `t` (and long modulus `p`)
+# The bootstrapping key provides `s` encrypted under `t` to allow this computation to take place
+@dataclass
+class BootstrappingKeyComponent():
+    factors: list # [encoded ciphertext]
+
+@dataclass
+class BootstrappingKey():
+    values: list # [BootstrappingKeyComponent]
+    zero: Ciphertext
+    one: Ciphertext
+    old_modulus: int
+    new_modulus: int
+
+def mk_bootstrapping_key(s, t, q, p):
+    bit_count = bit_length(q)
+    # To make bootstrapping even easier, we generate *all* possible multiples of each s[i]
+    # This means that evaluating an inner product s[0]*aux[0] + ... + s[k-1]*aux[k-1] is just a sum
+    values = []
+    for i in range(len(s)):
+        factors = []
+        for j in range(q):
+            factors.append(binary_encode((s[i] * j)%q, bit_count, encrypt(t, 0, p), encrypt(t, 1, p)))
+        values.append(BootstrappingKeyComponent(factors=factors))
+    return BootstrappingKey(
+        values = values,
+        zero = encrypt(t, 0, p),
+        one = encrypt(t, 1, p),
+        old_modulus = q,
+        new_modulus = p
+    )
+
+def bootstrap(ct, bk, tk):
+    print("Bootstrapping")
+    # Components of -(s[0] * aux[0] + ... + s[k-1] * aux[k-1])
+    inner_product_components = [bk.values[i].factors[bk.old_modulus-ct.aux[i]] for i in range(len(ct.aux))]
+    # Components of q/2 + o - (s[0] * aux[0] + ... + s[k-1] * aux[k-1])
+    # For q/2, we take the highest even number below q/2, to avoid changing the parity of the result
+    # The goal of the q/2 offset is to move the range -q/2...q/2 into the range 0.....q, so we do not
+    # have to deal with negative numbers
+    all_components = [binary_encode(ct.out + (bk.old_modulus // 4) * 2, len(inner_product_components[0]), bk.zero, bk.one)] + inner_product_components
+    # For a series of ranges, we compute (1 if start <= sum(all_components) < end else 0) and (sum(all_components) - start) % 2
+    inrange_and_parity = []
+    for i in range(len(bk.values)+1):
+        print("Computing inrange and parity bit {} of {}".format(i, len(bk.values)+1))
+        inrange_and_parity.append(add_and_return_remainder_parity_and_rangecheck(all_components, (bk.old_modulus * i) or 2, bk.old_modulus * (i+1), bk.zero, bk.one, tk))
+    # Pick out the correct range (this is basically an inefficient but depth-minimizing way of taking the
+    # sum mod q) and return the parity within that range
+    print("Inrange and parity bits computed, computing inner product...")
+    return sum([multiply_ciphertexts(r, p, tk) for r,p in inrange_and_parity], ZERO_CT)
