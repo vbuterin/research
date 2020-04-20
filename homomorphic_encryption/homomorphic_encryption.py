@@ -1,75 +1,66 @@
 # A toy homomorphic encryption implementation, based on
-# https://eprint.iacr.org/2011/344.pdf
-# Does not include bootstrapping, so only supports circuits up to
-# logarithmically high degree
+# https://eprint.iacr.org/2012/078.pdf
 
 from dataclasses import dataclass
 import random
 
-ERROR_DIGITS = 4
+ERROR_BITS = 6
 
 # Returns the bit length of n, eg. 6 -> 110 -> 3, 31 -> 11111 -> 5, 32 -> 100000 -> 6
 def bit_length(n):
     return len(bin(n))-2
 
 # Random length-l vector in a field with the given modulus
-def random_vector(l, modulus):
-    return [random.randrange(modulus) for _ in range(l)]
+def random_vector(l, precision):
+    return [random.randrange(2**precision) for _ in range(l)]
 
-# Generates an (even) noise value within some small range
+# Generates a noise value within some small range
 def noise():
-    return random.randrange(-2**ERROR_DIGITS, ERROR_DIGITS)
+    return random.randrange(-2**ERROR_BITS, ERROR_BITS)
 
 # Inner product of two vectors, that is compute sum(vec1[i] * vec2[i]).
-# Allows special case for empty vectors
-def prod(vec1, vec2, modulus):
-    return sum([i*j for i,j in zip(vec1, vec2)]) % modulus if (vec1 and vec2) else 0
+# Note that it is done modulo 2**precision.
+def prod(vec1, vec2, precision):
+    return sum([i*j for i,j in zip(vec1, vec2)]) & (2**precision-1)
 
-# Generates a private key
-def generate_key(length, modulus):
-    return [1] + [(2**ERROR_DIGITS + noise()) % modulus for _ in range(1, length)]
+# Generates a private key. The first value must always be 1.
+def generate_key(length, precision):
+    return [1] + [(2**ERROR_BITS + noise()) & (2**precision-1) for _ in range(1, length)]
 
-# A ciphertext representing some value m in {0,1}
-# Ciphertexts are of the form (aux, out) where out = aux . key + m + 2e
-# where . is the inner product and 2e is an even error term
+# A ciphertext representing some value m in {0,1}. A ciphertext is a
+# vector v where v . k = m * q/2 + e where . is the inner product,
+# q is the modulus (2**precision) and e is the error
 @dataclass
 class Ciphertext():
     values: list # [int]
-    modulus: int
+    precision: int
 
-    # Add together two ciphertexts into one, linearly combining the aux and out.
+    # Add together two ciphertexts into one, linearly adding together the values
     # Note that this combines the magnitudes of the error, so if you add waaaaay
     # too many times the error may overflow
     def __add__(self, other):
-        # Special cases for "null" ciphertexts
-        if self.modulus == 0:
-            return other
-        if other.modulus == 0:
-            return self
-        assert self.modulus == other.modulus and len(self.values) == len(other.values)
+        assert self.precision == other.precision and len(self.values) == len(other.values)
         return Ciphertext(
-            values = [(x+y) % self.modulus for x,y in zip(self.values, other.values)],
-            modulus = self.modulus,
+            values = [(x+y) & (2**self.precision-1) for x,y in zip(self.values, other.values)],
+            precision = self.precision,
         )
 
     # Convert 0 to 1 or 1 to 0
     def flip(self):
-        new_first_value = (self.values[0] + self.modulus // 2) % self.modulus
-        return Ciphertext(values=new_first_value+self.values[1:], modulus=self.modulus)
+        new_first_value = (self.values[0] ^ (2**(self.precision-1)))
+        return Ciphertext(values=new_first_value+self.values[1:], precision=self.precision)
 
-# A dummy ciphertext to represent zero
-ZERO_CT = Ciphertext(values=[], modulus=0)
-
+# Add together more than 2 ciphertexts 
 def sum_ciphertexts(ciphertexts):
     assert len(ciphertexts) >= 1
-    L, m = len(ciphertexts[0].values), ciphertexts[0].modulus
+    L, p = len(ciphertexts[0].values), ciphertexts[0].precision
     for c in ciphertexts[1:]:
-        assert c.modulus == m and len(c.values) == L
+        assert c.precision == p and len(c.values) == L
+    mask = (2**p)-1
     return Ciphertext(
-        values = [sum([c.values[i] for c in ciphertexts]) % m for i in range(L)],
-        modulus = m
+        values = [sum([c.values[i] for c in ciphertexts]) & mask for i in range(L)],
+        precision = p
     )
-
 
 # Generate public key (bunch of encryptions of zero)
 @dataclass
@@ -84,43 +75,43 @@ def mk_public_key(key, q):
         o.append(Ciphertext([(noise() + canceling_value) % q] + rv, q))
     return PublicKey(samples=o)
 
-# Encrypt a value (remember: out = aux . key + m + 2e)
-def encrypt(key, message, q):
-    return partial_encrypt(key, message * q // 2, q)
+# Encrypt a value
+def encrypt(key, message, precision):
+    return partial_encrypt(key, message * 2**(precision-1), precision)
 
 # Partially encrypt a value, assuming it's already in rescaled form
-# (ie. 0 for a normal 0 and q//2 for a normal 1). Used for encrypting
-# key shares for relinerization
-def partial_encrypt(key, message, q):
+# (ie. 0 for a normal 0 and q/2 for a normal 1). Used directly when
+# encrypting key shares for relinerization
+def partial_encrypt(key, message, precision):
     assert key[0] == 1
     for k in key:
-        assert k <= 2**(ERROR_DIGITS+1)
-    rv = random_vector(len(key)-1, q)
-    canceling_value = -prod(rv, key[1:], q) % q
-    return Ciphertext([(noise() + canceling_value + message) % q] + rv, q)
+        assert k <= 2**(ERROR_BITS+1)
+    rv = random_vector(len(key)-1, precision)
+    # -k[1:].v[1:]. Adding this value in as v[0] ensures that
+    # v[0] + k[1:].v[1:] = k[0]*v[0] + k[1:].v[1:] = k.v equals the desired message
+    canceling_value = -prod(rv, key[1:], precision)
+    return Ciphertext([(noise() + canceling_value + message) & (2**precision-1)] + rv, precision)
 
-# Partially decrypt a ciphertext, providing the output (0 or 1) plus noise (2e)
+# Partially decrypt a ciphertext, providing the output (0 or 1) plus noise (e)
 # Useful mainly for debugging
-# Note that if the noise turns out to be negative (true half the time), then
-# you get a negative value, which appears to be a value close to the modulus
-# with a flipped parity, eg. if modulus = 97, -4 appears as 93
 def partial_decrypt(key, ciphertext):
-    return prod(ciphertext.values, key, ciphertext.modulus)
+    return prod(ciphertext.values, key, ciphertext.precision)
 
-# Another debugging method: get magnitude of error
-def error_digits(key, ciphertext):
+# Another debugging method: get magnitude of error in bits
+def error_bits(key, ciphertext):
     o = partial_decrypt(key, ciphertext)
-    return len(str(min(
+    return bit_length(min(
         o,
-        ciphertext.modulus-o,
-        abs(ciphertext.modulus//2-o)
-    )))
+        2**ciphertext.precision-o,
+        abs(2**(ciphertext.precision-1)-o)
+    ))
 
 # Decrypt a ciphertext, outputting the message 0 or 1
 def decrypt(key, ciphertext):
-    values, q = ciphertext.values, ciphertext.modulus
-    return 1 if (q//4 < prod(values, key, q) <= (q*3)//4) else 0
+    values, p = ciphertext.values, ciphertext.precision
+    return 1 if (2**(p-2) < prod(values, key, p) <= 3 * 2**(p-2)) else 0
 
+# A transit key component contains 
 @dataclass
 class TransitKeyComponent():
     digits: list # [[ciphertext]]
@@ -129,62 +120,66 @@ class TransitKeyComponent():
         if index:
             return sum_ciphertexts([self.digits[power] for power in range(len(self.digits)) if (index >> power) % 2 == 1])
         else:
-            return Ciphertext(values=[0] * len(self.digits[0].values), modulus=self.digits[0].modulus)
+            return Ciphertext(values=[0] * len(self.digits[0].values), precision=self.digits[0].precision)
 
 @dataclass
 class TransitKey():
     pairs: list # [list][TransitKeyComponent]
 
-@dataclass
-class ModulusChangeKey():
-    items: list # [TransitKeyComponent]
-    old_modulus: int
-    new_modulus: int
+# Converts a key [s1, s2, s3...] into a key [first bit of s1, second bit of s1 ..., first bit of s2, second bit of s2...]
+def flatten_key(s):
+    return sum([[(x >> i) % 2 for i in range(ERROR_BITS+1)] for x in s], [])
 
-def flatten_key(s, modulus):
-    return sum([[(x >> i) % 2 for i in range(ERROR_DIGITS+1)] for x in s], [])
-
+# Converts a ciphertext [c1, c2, c3...] into a ct [c1, 2c1, 4c1...., c2, 2c2, 4c2....]
+# The goal of the above transformation and this one is that we achieve:
+# (i) s . ct = flatten_key(s) . flatten_ct(ct)
+# (ii) |flatten_key(s)[i]| in {0,1} for all i
+# This prevents error blowup when multiplying
 def flatten_ciphertext(ct):
     return Ciphertext(
-        values=sum([[(x << i) % ct.modulus for i in range(ERROR_DIGITS+1)] for x in ct.values], []),
-        modulus=ct.modulus
+        values=sum([[(x << i) & (2**ct.precision-1) for i in range(ERROR_BITS+1)] for x in ct.values], []),
+        precision=ct.precision
     )
 
-def mk_transit_key(s, t, q):
-    # For each v=s[i], and for each product v = s[i] * s[j], encrypt v, v*2, v*3... v*base, v*2*base, v*3*base...
+def mk_transit_key(s, t, precision):
+    # For each v=s[i], and for each product v = s[i] * s[j], encrypt v, v*2, v*4, v*8.....
     # under the key `t`.
     # This allows us to compute s[i] * b or s[i] * s[j] * b for any b with a logarithmic number
     # of additions (and hence logarithmic-sized error blowup)
-    s = flatten_key(s, q)
+    s = flatten_key(s)
     pairs = []
     for i in range(len(s)):
-        pairs.append([TransitKeyComponent(digits=[partial_encrypt(t, ((s[i]*s[j])<<power) % q, q) for power in range(bit_length(q))]) for j in range(i+1)])
+        pairs.append([TransitKeyComponent(digits=[partial_encrypt(t, (s[i]*s[j])<<power , precision) for power in range(precision)]) for j in range(i+1)])
     return TransitKey(pairs=pairs)
 
 def multiply_ciphertexts(c1, c2, transit_key):
     # The idea here is that we take the equation
     #
-    # dec(c1) * dec(c2) = (b1 - s.a1) * (b2 - s.a2) = b1b2 - (b1*a2).s - (b2*a1).s + s1⁰s2.a1⁰a2
+    # dec(v1) * dec(v2) = v1.s * v2.s = (v1⁰v2).(s⁰s)
     #
     # (where ⁰ is the outer product, ie. the set of all vec1[i]*vec2[j])
     #
     # except instead of evaluating it directly (we can't because we don't have the key), we
-    # use the transit key to evaluate the equation as a linear combination of s[i] and s[i]*s[j],
+    # use the transit key to evaluate the equation as a linear combination of s[i]*s[j],
     # giving us the decrypted output, encrypted under `t` (the target key of the transit key)
     c1, c2 = flatten_ciphertext(c1), flatten_ciphertext(c2)
     v1, v2 = c1.values, c2.values
-    dim, modulus = len(v1), c1.modulus
-    return sum_ciphertexts([transit_key.pairs[max(i,j)][min(i,j)].get_combination_for((v1[i] * v2[j] * 2 // modulus) % modulus) for i in range(dim) for j in range(dim)])
+    dim, precision, mask = len(v1), c1.precision, (2**c1.precision)-1
+    return sum_ciphertexts([transit_key.pairs[max(i,j)][min(i,j)].get_combination_for(((v1[i] * v2[j]) >> (precision-1)) & mask) for i in range(dim) for j in range(dim)])
 
+# Encode an integer into a binary representation (least significant bits first)
 def binary_encode(integer, length, encoded_zero, encoded_one):
     return [encoded_one if integer & (1 << i) else encoded_zero for i in range(length)]
 
+# Decrypt a series of ciphertexts that represent an integer in binary representation
 def binary_decrypt(key, output):
     return sum([decrypt(key, o) << i for i,o in enumerate(output)])
 
+# Logical OR
 def _or(a, b, tk):
     return a + b + multiply_ciphertexts(a, b, tk)
 
+# Logical AND
 _and = multiply_ciphertexts
 
 # Kogge-Stone adder, see https://upload.wikimedia.org/wikipedia/commons/1/1c/4_bit_Kogge_Stone_Adder_Example_new.png
@@ -224,88 +219,78 @@ def three_to_two(a, b, c, zero, tk):
 
 # Add together many numbers. Use the 3->2 adder in a tree structure (ok fine it's a DAG),
 # then finish off with a 3-to-1 or 2-to-1 as needed
-def multi_add(values, zero, tk):
+def multi_add(values, zero, tk, bits=999999999999999):
     while len(values) > 2:
+        print("Multi adding {} values".format(len(values)))
         o = []
         for i in range(0, len(values)-2, 3):
             x, y = three_to_two(values[i], values[i+1], values[i+2], zero, tk)
-            o.extend([x, y])
+            o.extend([x[:bits], y[:bits]])
         o.extend(values[len(values) - len(values) % 3:])
         values = o
-    return encoded_add(values[0], values[1], tk) if len(values) == 2 else encoded_add3(values[0], values[1], values[2], tk)
+    return encoded_add(values[0], values[1], tk)[:bits] if len(values) == 2 else encoded_add3(values[0], values[1], values[2], tk)[:bits]
 
-def next_prime(n):
-    x = n + (n % 2) + 1
-    while pow(2, x, x) != 2:
-        x += 2
-    return x
-
-# Takes the sum of the values and returns two bits:
-# (i) is sum(values) in (range_start....range_end-1)
-# (ii) is sum(values) - range_start odd (1) or even (0)?
-def add_and_return_remainder_parity_and_rangecheck(values, range_start, range_end, zero, one, tk):
-    assert range_end > range_start >= 1
-    bit_count = bit_length(range_end)
-    # 10000000000 - range_start = 1111111111 - (range_start-1)
-    encoded_complement_rstart = binary_encode(range_start - 1, bit_count, one, zero)
-    # 10000000000 - range_end = 1111111111 - (range_end-1)
-    encoded_complement_rend = binary_encode(range_end - 1, bit_count, one, zero)
-    # Should be >= 10000000000 if in range
-    sum_with_range_start = multi_add(values + [encoded_complement_rstart], zero, tk)
-    # Should be < 10000000000 if in range
-    sum_with_range_end = multi_add(values + [encoded_complement_rend], zero, tk)
-    is_in_range = _and(sum_with_range_start[bit_count], one + sum_with_range_end[bit_count], tk)
-    parity = sum_with_range_start[0]
-    return is_in_range, parity
+# Adjusts a ciphertext's precision, chopping off lower-order bits. This does not
+# magnify the error by more than a small amount!
+def adjust_ciphertext_precision(ct, new_precision):
+    if new_precision < ct.precision:
+        new_values = [x >> (ct.precision - new_precision) for x in ct.values]
+    else:
+        new_values = [x << (new_precision - ct.precision) for x in ct.values]
+    return Ciphertext(values=new_values, precision=new_precision)
 
 # A key used for the bootstrapping procedure. This involves running a decryption circuit for
 # scheme key `s` (and short modulus `q`) homomorphically encrypted under key `t` (and long modulus `p`)
 # The bootstrapping key provides `s` encrypted under `t` to allow this computation to take place
 @dataclass
-class BootstrappingKeyComponent():
-    factors: list # [encoded ciphertext]
-
-@dataclass
 class BootstrappingKey():
-    values: list # [BootstrappingKeyComponent]
+    values: list # [list[ciphertext]]
     zero: Ciphertext
     one: Ciphertext
-    old_modulus: int
-    new_modulus: int
+    short_precision: int
+    long_precision: int
 
-def mk_bootstrapping_key(s, t, q, p):
-    bit_count = bit_length(q)
-    # To make bootstrapping even easier, we generate *all* possible multiples of each s[i]
-    # This means that evaluating an inner product s[0]*aux[0] + ... + s[k-1]*aux[k-1] is just a sum
+def mk_bootstrapping_key(s, t, long_precision, short_precision):
+    # Basically an encryption of every bit of every s[i] under t
     values = []
-    for i in range(len(s)):
-        factors = []
-        for j in range(q):
-            factors.append(binary_encode((s[i] * j)%q, bit_count, encrypt(t, 0, p), encrypt(t, 1, p)))
-        values.append(BootstrappingKeyComponent(factors=factors))
+    for x in s:
+        bits = []
+        for j in range(ERROR_BITS+1):
+            bits.append(encrypt(t, (x >> j) % 2, long_precision))
+        values.append(bits)
     return BootstrappingKey(
         values = values,
-        zero = encrypt(t, 0, p),
-        one = encrypt(t, 1, p),
-        old_modulus = q,
-        new_modulus = p
+        zero = encrypt(t, 0, long_precision),
+        one = encrypt(t, 1, long_precision),
+        short_precision = short_precision,
+        long_precision = long_precision
     )
 
 def bootstrap(ct, bk, tk):
     print("Bootstrapping")
-    # Components of -(s[0] * aux[0] + ... + s[k-1] * aux[k-1])
-    inner_product_components = [bk.values[i].factors[bk.old_modulus-ct.aux[i]] for i in range(len(ct.aux))]
-    # Components of q/2 + o - (s[0] * aux[0] + ... + s[k-1] * aux[k-1])
-    # For q/2, we take the highest even number below q/2, to avoid changing the parity of the result
-    # The goal of the q/2 offset is to move the range -q/2...q/2 into the range 0.....q, so we do not
-    # have to deal with negative numbers
-    all_components = [binary_encode(ct.out + (bk.old_modulus // 4) * 2, len(inner_product_components[0]), bk.zero, bk.one)] + inner_product_components
-    # For a series of ranges, we compute (1 if start <= sum(all_components) < end else 0) and (sum(all_components) - start) % 2
-    inrange_and_parity = []
-    for i in range(len(bk.values)+1):
-        print("Computing inrange and parity bit {} of {}".format(i, len(bk.values)+1))
-        inrange_and_parity.append(add_and_return_remainder_parity_and_rangecheck(all_components, (bk.old_modulus * i) or 2, bk.old_modulus * (i+1), bk.zero, bk.one, tk))
-    # Pick out the correct range (this is basically an inefficient but depth-minimizing way of taking the
-    # sum mod q) and return the parity within that range
-    print("Inrange and parity bits computed, computing inner product...")
-    return sum([multiply_ciphertexts(r, p, tk) for r,p in inrange_and_parity], ZERO_CT)
+    # Start by squashing the ciphertext to a shorter precision for easier calculation
+    squashed_ct = adjust_ciphertext_precision(ct, bk.short_precision)
+    # The i'th bin represents bits with place value 2**i
+    inner_product_bits = [[] for _ in range(bk.short_precision)]
+    # Compute s.ct = s[0] * ct[0] + ... + s[k-1] * ct[k-1]
+    # We do this by walking through every bit in every s[i] and adding it to
+    # every bin where the corresponding bit of ct[i] is 1. This is basically the
+    # same as textbook addition and multiplication, except we can't add or carry
+    # (yet) because the s[i] bits are all encrypted
+    for ct_value, bk_value in zip(squashed_ct.values, bk.values):
+        for ct_bit in range(bk.short_precision):
+            if (ct_value >> ct_bit) % 2:
+                for key_bit in range(min(ERROR_BITS+1, bk.short_precision-ct_bit)):
+                    inner_product_bits[ct_bit + key_bit].append(bk_value[key_bit])
+    print('Packed bits')
+    # To combine all the bins, we'll just keep grabbing one bit from each bin, pretend
+    # that's an integer, and add up all the integers
+    max_inner_product_bit_count = max(len(x) for x in inner_product_bits)
+    as_integer_encodings = [[inner_product_bits[i][j] if j < len(inner_product_bits[i]) else bk.zero for i in range(bk.short_precision)] for j in range(max_inner_product_bit_count)]
+    print('Adding {} integers'.format(len(as_integer_encodings)))
+    # Final sum mod 2**short_precision
+    total = multi_add(as_integer_encodings, bk.zero, tk, bk.short_precision)
+    # 1 if the top two digits are 10 or 01, 0 if they are 00 or 11
+    # This is equivalent to "1 if the value is closer to q/2, 0 if it's
+    # closer to 0"
+    return total[bk.short_precision-1] + total[bk.short_precision-2]
