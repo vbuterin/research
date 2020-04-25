@@ -26,6 +26,11 @@ def add_vectors(*args):
         assert len(inp) == length
     return [sum(inp[i] for inp in inputs) & (2**precision-1) for i in range(length)]
 
+# M -> kM, self-explanatory
+def mul_by_const(M, factor, precision):
+    mask = 2**precision-1
+    return [[(x*factor) & mask for x in row] for row in M]
+
 # Matrix addition; self-explanatory
 def matrix_add(*args):
     inputs, precision = args[:-1], args[-1]
@@ -97,22 +102,87 @@ def encrypt(key, value, precision):
 # Decrypts a value, by distinguishing the two above scenarios
 def decrypt(key, ct, precision):
     key_powers = vector_matrix_multiply(key, generate_powers_matrix(len(key), precision), precision)
-    # Pick a column where we can easily distinguish a small error from an element of key*powers
-    col = random.randrange(1, len(key_powers))
-    while key_powers[col] >> (precision-2) in (0, 3):
-        col = random.randrange(1, len(key_powers))
+    # The structure of the key ensures that key_powers[col] = 2**precision/2, making it maximally easy
+    # to distinguish encryptions of 1 from 0
+    col = precision-1
     # If plaintext=0, prod = small error (at that column)
     # If plaintext=1, prod = key*powers + small error (at that column)
     prod = inner_product([row[col] for row in ct], key, precision)
-    return 0 if prod <= key_powers[col]//2 or prod > (key_powers[col]+2**precision)//2 else 1
+    return 0 if prod >> (precision-2) in (0, 3) else 1
 
-# Returns the magnitude of the error in the ciphertext (for debugging purposes)
+# Returns the log2 of the error in the ciphertext (for debugging purposes)
 def get_error(key, ct, precision):
     key_powers = vector_matrix_multiply(key, generate_powers_matrix(len(key), precision), precision)
-    col = random.randrange(1, len(key_powers))
-    while key_powers[col] >> (precision-2) in (0, 3):
-        col = random.randrange(1, len(key_powers))
+    col = precision-1
     prod = inner_product([row[col] for row in ct], key, precision)
-    target = 0 if prod <= key_powers[col]//2 or prod > (key_powers[col]+2**precision)//2 else key_powers[col]
-    return min(abs(prod-target), 2**precision-abs(prod-target))
+    return len(bin(min(prod, abs(2**(precision-1) - prod), 2**precision-prod)))-2
 
+# Multiply ciphertexts
+def multiply_ciphertexts(A, B, precision):
+    o = matrix_multiply(A, bitify(B, precision), precision)
+    assert len(o) == len(A) == len(B) and len(o[0]) == len(A[0]) == len(B[0])
+    return o
+
+# Encode an integer into a binary representation (least significant bits first)
+def binary_encode(integer, length, encoded_zero, encoded_one):
+    return [encoded_one if integer & (1 << i) else encoded_zero for i in range(length)]
+
+def binary_encrypt(key, integer, length, precision):
+    return [encrypt(key, (integer >> i) % 2, precision) for i in range(length)]
+
+# Decrypt a series of ciphertexts that represent an integer in binary representation
+def binary_decrypt(key, output, precision):
+    return sum([decrypt(key, o, precision) << i for i,o in enumerate(output)])
+
+# Logical operators
+# Note that for all of these operators, you economize on error by putting the
+# highest-error argument last
+def _and(ct1, ct2, precision):
+    return multiply_ciphertexts(ct1, ct2, precision)
+
+def _or(ct1, ct2, precision):
+    return matrix_add(ct1, ct2, mul_by_const(multiply_ciphertexts(ct1, ct2, precision), -1, precision), precision)
+
+def _xor(ct1, ct2, precision):
+    return matrix_add(ct1, ct2, mul_by_const(multiply_ciphertexts(ct1, ct2, precision), -2, precision), precision)
+
+# 1 if at least two of the inputs are 1, else 0
+def two_of_three(ct1, ct2, ct3, precision):
+    ab_plus_ac = multiply_ciphertexts(ct1, matrix_add(ct2, ct3, precision), precision)
+    bc = multiply_ciphertexts(ct2, ct3, precision)
+    minus_two_abc = mul_by_const(multiply_ciphertexts(ct1, bc, precision), -2, precision)
+    return matrix_add(ab_plus_ac, bc, minus_two_abc, precision)
+
+# Adds the binary encodings of a and b
+def encoded_add(a, b, precision):
+    o = []
+    carry = mul_by_const(a[0], 0, precision)
+    for i in range(len(a)):
+        two_of_three_abc = two_of_three(a[i], b[i], carry, precision)
+        odd_of_three_abc = matrix_add(a[i], b[i], carry, mul_by_const(two_of_three_abc, -2, precision), precision)
+        o.append(odd_of_three_abc)
+        carry = two_of_three_abc
+    return o + [carry]
+
+# Converts a+b+c into v+w such that a+b+c = v+w. Multiplicative depth 1.
+def three_to_two(a, b, c, precision):
+    zero = mul_by_const(a[0], 0, precision)
+    two_of_three_abc = [two_of_three(ai, bi, ci, precision) for ai, bi, ci in zip(a,b,c)]
+    odd_of_three_abc = [matrix_add(ai, bi, ci, mul_by_const(tti, -2, precision), precision) for ai, bi, ci, tti in zip(a, b, c, two_of_three_abc)]
+    return (
+        odd_of_three_abc + [zero],
+        [zero] + two_of_three_abc
+    )
+
+# Add together many numbers. Use the 3->2 adder in a tree structure (ok fine it's a DAG),
+# then finish off with a 3-to-1 or 2-to-1 as needed
+def multi_add(values, precision, bits=999999999999999):
+    while len(values) > 2:
+        print("Multi adding {} values".format(len(values)))
+        o = []
+        for i in range(0, len(values)-2, 3):
+            x, y = three_to_two(values[i], values[i+1], values[i+2], precision)
+            o.extend([x[:bits], y[:bits]])
+        o.extend(values[len(values) - len(values) % 3:])
+        values = o
+    return encoded_add(values[0], values[1], precision)[:bits]
