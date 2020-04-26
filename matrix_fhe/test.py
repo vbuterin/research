@@ -47,6 +47,17 @@ def test():
     print([get_error(k, ct, PRECISION) for ct in one_one_one])
     assert binary_decrypt(k, one_one_one[:8], PRECISION) == 111
     print("Simple addition test passed")
+    for a in range(4):
+        ct1 = binary_encrypt(k, a, 2, PRECISION)
+        for b in range(4):
+            print(a,b)
+            ct2 = binary_encrypt(k, b, 2, PRECISION)
+            assert binary_decrypt(k, encoded_add(ct1, ct2, PRECISION), PRECISION) == a+b
+            for c in range(4):
+                ct3 = binary_encrypt(k, c, 2, PRECISION)
+                x, y = three_to_two(ct1, ct2, ct3, PRECISION)
+                assert binary_decrypt(k, x, PRECISION) + binary_decrypt(k, y, PRECISION) == a+b+c
+    print("Complete addition tests passed")
     x, y = three_to_two(forty_two, sixty_nine, one_one_one, PRECISION)
     print([get_error(k, ct, PRECISION) for ct in x+y])
     assert binary_decrypt(k, x, PRECISION) + binary_decrypt(k, y, PRECISION) == 222
@@ -55,8 +66,8 @@ def test():
     assert binary_decrypt(k, two_two_two[:8], PRECISION) == 222
     print("Three-item addition test passed")
     values = [random.randrange(1000) for i in range(8)]
-    ciphertexts = [binary_encrypt(k, v, 10, PRECISION) for v in values]
-    sum_ciphertext = multi_add(ciphertexts, PRECISION, bits=13)
+    ciphertexts = [binary_encrypt(k, v, 11, PRECISION) for v in values]
+    sum_ciphertext = multi_add(ciphertexts, PRECISION, bits=14)
     print([get_error(k, ct, PRECISION) for ct in sum_ciphertext])
     print(binary_decrypt(k, sum_ciphertext, PRECISION), values)
     assert binary_decrypt(k, sum_ciphertext, PRECISION) == sum(values)
