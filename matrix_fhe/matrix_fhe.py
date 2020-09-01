@@ -67,7 +67,7 @@ def inner_product(v1, v2, precision):
 
 # Splits up each value in a matrix into bits.
 # Example: [[1, 2], [3, 4]], precision=3
-# Output: [[1, 0, 0, 0, 1, 0], [1, 1, 0, 0, 0, 1]]
+# Output: [[1, 0], [0, 1], [0, 0], [1, 0], [1, 0], [0, 1]]
 def bitify(matrix, precision):
     o = []
     for row in matrix:
